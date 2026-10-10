@@ -1,0 +1,789 @@
+diff --git a/dist/paper-full.js b/dist/paper-full.js
+index 5a0fbcd..b8842c5 100644
+--- a/dist/paper-full.js
++++ b/dist/paper-full.js
+@@ -1,5 +1,6 @@
+ /*!
+  * Paper.js v0.12.7 - The Swiss Army Knife of Vector Graphics Scripting.
++ * Nyaitter collaboration fork: emits source-level edit gesture events.
+  * http://paperjs.org/
+  *
+  * Copyright (c) 2011 - 2020, Jürg Lehni & Jonathan Puckey
+@@ -24,7 +25,8 @@
+ 
+ var paper = function(self, undefined) {
+ 
+-self = self || require('./node/self.js');
++self = self || (typeof module === 'object' && module && module.require
++		? module.require('@turbowarp/paper/dist/node/self.js') : {});
+ var window = self.window ? self.window : self,
+ 	document = self.document;
+ 
+@@ -2894,7 +2896,7 @@ var Project = PaperScopeItem.extend({
+ 		return Base.serialize(this._children, options, true, dictionary);
+ 	},
+ 
+-	_changed: function(flags, item) {
++	_changed: function(flags, item, selectionOnly) {
+ 		if (flags & 1) {
+ 			var view = this._view;
+ 			if (view) {
+@@ -2904,6 +2906,30 @@ var Project = PaperScopeItem.extend({
+ 			}
+ 		}
+ 		var changes = this._changes;
++		var collaborationItems = this._nyaitterGestureItems;
++		if (!selectionOnly && collaborationItems && !this._nyaitterApplyingCollaborationPreview
++				&& item && item._id != null)
++			collaborationItems[item._id] = item;
++		var originalPaths = this._nyaitterGestureOriginalItemPaths,
++			originalPath = !selectionOnly && collaborationItems && this._nyaitterPointerGestureActive
++				&& !this._nyaitterApplyingCollaborationPreview
++				&& item && originalPaths && originalPaths[item._id];
++		if (originalPath) {
++			var hiddenItems = this._nyaitterGestureHiddenItems
++				|| (this._nyaitterGestureHiddenItems = []),
++			pathKey = originalPath.join('.'),
++			alreadyHidden = hiddenItems.some(function(path) {
++				return path.join('.') === pathKey;
++			});
++			if (!alreadyHidden)
++				hiddenItems.push(originalPath);
++		}
++		var collaborationChanges = this._nyaitterCollaborationChanges;
++		if (!selectionOnly && collaborationChanges && item && item._id != null
++				&& !this._nyaitterApplyingCollaborationPreview
++				&& !item._nyaitterRemotePreview && !item.guide
++				&& !(item._data && item._data.isHelperItem))
++			collaborationChanges[item._id] = item;
+ 		if (changes && item) {
+ 			var changesById = this._changesById,
+ 				id = item._id,
+@@ -3251,7 +3277,7 @@ new function() {
+ 		return [ this._class, props ];
+ 	},
+ 
+-	_changed: function(flags) {
++	_changed: function(flags, selectionOnly) {
+ 		var symbol = this._symbol,
+ 			cacheParent = this._parent || symbol,
+ 			project = this._project;
+@@ -3269,7 +3295,7 @@ new function() {
+ 			Item._clearBoundsCache(this);
+ 		}
+ 		if (project)
+-			project._changed(flags, this);
++			project._changed(flags, this, selectionOnly);
+ 		if (symbol)
+ 			symbol._changed(flags);
+ 	},
+@@ -3338,8 +3364,14 @@ new function() {
+ 			this._selection = selection;
+ 			var project = this._project;
+ 			if (project) {
++				if (!project._nyaitterApplyingCollaborationPreview)
++					project._nyaitterSelectionObserved = true;
+ 				project._updateSelection(this);
+-				this._changed(257);
++				this._changed(257, true);
++				if (!project._nyaitterApplyingCollaborationPreview
++						&& project._view
++						&& project._view.notifyCollaborationPaintSelectionChange)
++					project._view.notifyCollaborationPaintSelectionChange();
+ 			}
+ 		}
+ 	},
+@@ -4759,6 +4791,10 @@ new function() {
+ 	},
+ 
+ 	_drawSelection: function(ctx, matrix, size, selectionItems, updateVersion) {
++		for (var hiddenItem = this; hiddenItem; hiddenItem = hiddenItem._parent) {
++			if (hiddenItem._nyaitterRemoteHiddenOwners)
++				return;
++		}
+ 		var selection = this._selection,
+ 			itemSelected = selection & 1,
+ 			boundsSelected = selection & 2
+@@ -5975,7 +6011,7 @@ var Segment = Base.extend({
+ 		this._selection = selection = selection || 0;
+ 		if (path && selection !== oldSelection) {
+ 			path._updateSelection(this, oldSelection, selection);
+-			path._changed(257);
++			path._changed(257, true);
+ 		}
+ 	},
+ 
+@@ -12883,6 +12919,10 @@ var View = Base.extend(Emitter, {
+ 		this._frameItems = {};
+ 		this._frameItemCount = 0;
+ 		this._itemEvents = { native: {}, virtual: {} };
++		this._nyaitterRemotePreviews = {};
++		this._nyaitterRemoteHiddenItems = {};
++		this._nyaitterRemoteSelections = {};
++		this._nyaitterRemoteGestureVersions = {};
+ 		this._autoUpdate = !paper.agent.node;
+ 		this._needsUpdate = false;
+ 	},
+@@ -12890,6 +12930,7 @@ var View = Base.extend(Emitter, {
+ 	remove: function() {
+ 		if (!this._project)
+ 			return false;
++		this.clearCollaborationPaintPreviews();
+ 		if (View._focused === this)
+ 			View._focused = null;
+ 		View._views.splice(View._views.indexOf(this), 1);
+@@ -13021,6 +13062,482 @@ var View = Base.extend(Emitter, {
+ 		this._bounds = this._decomposed = undefined;
+ 	},
+ 
++	_getCollaborationPaintLayer: function() {
++		var layers = this._project && this._project.getLayers();
++		for (var i = 0, l = layers && layers.length || 0; i < l; i++) {
++			var data = layers[i].getData();
++			if (data && data.isGuideLayer)
++				return layers[i];
++		}
++		return null;
++	},
++
++	_getCollaborationPaintItemPath: function(item) {
++		var path = [];
++		while (item) {
++			var parent = item._parent,
++				children = parent && parent._children,
++				index = children ? children.indexOf(item) : -1;
++			if (index < 0)
++				return null;
++			path.unshift(index);
++			if (parent && parent._data && parent._data.isPaintingLayer)
++				return path;
++			if (parent && parent._data && parent._data.isHelperItem)
++				return null;
++			item = parent;
++		}
++		return null;
++	},
++
++	_getCollaborationPaintItemAtPath: function(path) {
++		if (!Array.isArray(path) || !path.length)
++			return null;
++		var layers = this._project && this._project.getLayers(),
++			item = null;
++		for (var layerIndex = 0, layerCount = layers && layers.length || 0;
++				layerIndex < layerCount; layerIndex++) {
++			if (layers[layerIndex]._data && layers[layerIndex]._data.isPaintingLayer) {
++				item = layers[layerIndex];
++				break;
++			}
++		}
++		if (!item)
++			return null;
++		for (var i = 0, l = path.length; i < l; i++) {
++			var index = Number(path[i]);
++			if (!isFinite(index) || index < 0 || index !== Math.floor(index)
++					|| !item || !item._children || !item._children[index])
++				return null;
++			item = item._children[index];
++		}
++		return item;
++	},
++
++	_getCollaborationPaintItemPaths: function(items) {
++		var selected = Array.isArray(items) ? items : this._project && this._project.getSelectedItems
++				? this._project.getSelectedItems() : [],
++			candidates = [],
++			seen = {};
++		for (var i = 0, l = selected.length; i < l; i++) {
++			var item = selected[i];
++			if (!item || item.guide || item._nyaitterRemotePreview
++					|| item._data && item._data.isHelperItem)
++				continue;
++			var path = this._getCollaborationPaintItemPath(item);
++			if (!path)
++				continue;
++			var key = path.join('.');
++			if (!seen[key]) {
++				seen[key] = true;
++				candidates.push(path);
++			}
++		}
++		candidates.sort(function(a, b) {
++			return a.length - b.length;
++		});
++		var paths = [];
++		for (var j = 0, count = candidates.length; j < count; j++) {
++			var candidate = candidates[j],
++				isChild = false;
++			for (var k = 0, previousCount = paths.length; k < previousCount; k++) {
++				var previous = paths[k];
++				if (previous.length >= candidate.length)
++					continue;
++				var matches = true;
++				for (var part = 0; part < previous.length; part++) {
++					if (previous[part] !== candidate[part]) {
++						matches = false;
++						break;
++					}
++				}
++				if (matches) {
++					isChild = true;
++					break;
++				}
++			}
++			if (!isChild)
++				paths.push(candidate);
++		}
++		return paths;
++	},
++
++	_getCollaborationPaintSelectionItemPaths: function() {
++		return this._getCollaborationPaintItemPaths();
++	},
++
++	getCollaborationPaintSelectionItemPaths: function() {
++		return this._getCollaborationPaintSelectionItemPaths();
++	},
++
++	getCollaborationPaintItemPaths: function(items) {
++		return this._getCollaborationPaintItemPaths(items);
++	},
++
++	getCollaborationPaintItemAtPath: function(path) {
++		return this._getCollaborationPaintItemAtPath(path);
++	},
++
++	notifyCollaborationPaintSelectionChange: function() {
++		var canvas = this._element,
++			windowObject = typeof window !== 'undefined' ? window : null;
++		if (!canvas || !windowObject || typeof windowObject.CustomEvent !== 'function')
++			return;
++		canvas.dispatchEvent(new windowObject.CustomEvent(
++			'nditor-paper-selectionchange', {
++				detail: {selectionItems: this._getCollaborationPaintSelectionItemPaths()}
++			}
++		));
++	},
++
++	beginCollaborationPaintChangeCapture: function() {
++		this._project._nyaitterCollaborationChanges = {};
++	},
++
++	takeCollaborationPaintChanges: function() {
++		var project = this._project,
++			changes = project._nyaitterCollaborationChanges || {};
++		project._nyaitterCollaborationChanges = {};
++		return Object.keys(changes).map(function(id) {
++			return changes[id];
++		}).filter(function(item) {
++			return item && !item._nyaitterRemotePreview && !item.guide
++				&& !(item._data && item._data.isHelperItem);
++		});
++	},
++
++	isCollaborationPaintPointerGestureActive: function() {
++		return Boolean(this._project._nyaitterPointerGestureActive);
++	},
++
++	_removeCollaborationPaintSelection: function(participantId) {
++		var key = String(participantId || ''),
++			items = this._nyaitterRemoteSelections[key] || [];
++		delete this._nyaitterRemoteSelections[key];
++		for (var i = 0, l = items.length; i < l; i++)
++			items[i].remove();
++	},
++
++	_captureCollaborationPaintSelection: function() {
++		var selected = this._project && this._project.getSelectedItems
++				? this._project.getSelectedItems() : [];
++		return selected.filter(function(item) {
++			return item && !item.guide && !item._nyaitterRemotePreview
++				&& !(item._data && item._data.isHelperItem);
++		}).map(function(item) {
++			return {item: item, selection: item.getSelection()};
++		});
++	},
++
++	_restoreCollaborationPaintSelection: function(selection) {
++		var project = this._project,
++			wasApplyingPreview = project._nyaitterApplyingCollaborationPreview;
++		project._nyaitterApplyingCollaborationPreview = true;
++		for (var i = 0, l = selection && selection.length || 0; i < l; i++) {
++			var entry = selection[i],
++				item = entry && entry.item;
++			if (item && item.isInserted() && item.getSelection() !== entry.selection)
++				item.setSelection(entry.selection);
++		}
++		project._nyaitterApplyingCollaborationPreview = wasApplyingPreview;
++	},
++
++	_createCollaborationPaintOutline: function(source, color) {
++		if (!source)
++			return null;
++		var project = this._project,
++			wasApplyingPreview = project._nyaitterApplyingCollaborationPreview;
++		project._nyaitterApplyingCollaborationPreview = true;
++		try {
++			var zoom = Math.max(Number(this.zoom) || 1, 0.1),
++				outline = source.clone(false),
++				outlineColor = color || '#0969da',
++				strokeWidth = 2 / zoom,
++				style = function(item) {
++					try {
++						item.fillColor = null;
++						item.strokeColor = outlineColor;
++						item.strokeWidth = strokeWidth;
++						item.opacity = 1;
++					} catch (e) {
++					}
++					var children = item.getChildren && item.getChildren();
++					for (var i = 0, l = children && children.length || 0; i < l; i++)
++						style(children[i]);
++				};
++			style(outline);
++			return this._insertCollaborationPaintItem(outline, outlineColor);
++		} catch (e) {
++			return null;
++		} finally {
++			project._nyaitterApplyingCollaborationPreview = wasApplyingPreview;
++		}
++	},
++
++	_setCollaborationPaintSelection: function(participantId, paths, color) {
++		var key = String(participantId || '');
++		this._removeCollaborationPaintSelection(key);
++		var items = [];
++		for (var i = 0, l = paths && paths.length || 0; i < l; i++) {
++			var source = this._getCollaborationPaintItemAtPath(paths[i]);
++			if (!source || source.guide || source._nyaitterRemotePreview)
++				continue;
++			var outline = this._createCollaborationPaintOutline(source, color);
++			if (outline)
++				items.push(outline);
++		}
++		if (items.length)
++			this._nyaitterRemoteSelections[key] = items;
++	},
++
++	_showCollaborationPaintItems: function(key) {
++		var hidden = this._nyaitterRemoteHiddenItems[key] || [];
++		delete this._nyaitterRemoteHiddenItems[key];
++		for (var i = 0, l = hidden.length; i < l; i++) {
++			var item = hidden[i],
++				owners = item && item._nyaitterRemoteHiddenOwners;
++			if (!owners)
++				continue;
++			delete owners[key];
++			var stillHidden = false;
++			for (var owner in owners) {
++				if (owner !== '_originalVisible') {
++					stillHidden = true;
++					break;
++				}
++			}
++			if (!stillHidden) {
++				var project = this._project,
++					wasApplyingPreview = project._nyaitterApplyingCollaborationPreview;
++				project._nyaitterApplyingCollaborationPreview = true;
++				item.setVisible(owners._originalVisible);
++				project._nyaitterApplyingCollaborationPreview = wasApplyingPreview;
++				delete item._nyaitterRemoteHiddenOwners;
++			}
++		}
++	},
++
++	_hideCollaborationPaintItems: function(key, paths) {
++		this._showCollaborationPaintItems(key);
++		var hidden = [];
++		for (var i = 0, l = paths && paths.length || 0; i < l; i++) {
++			var item = this._getCollaborationPaintItemAtPath(paths[i]);
++			if (!item || item.guide || item._nyaitterRemotePreview)
++				continue;
++			var owners = item._nyaitterRemoteHiddenOwners;
++			if (!owners)
++				owners = item._nyaitterRemoteHiddenOwners = {
++					_originalVisible: item.getVisible()
++				};
++			owners[key] = true;
++			var project = this._project,
++				wasApplyingPreview = project._nyaitterApplyingCollaborationPreview;
++			project._nyaitterApplyingCollaborationPreview = true;
++			item.setVisible(false);
++			project._nyaitterApplyingCollaborationPreview = wasApplyingPreview;
++			hidden.push(item);
++		}
++		if (hidden.length)
++			this._nyaitterRemoteHiddenItems[key] = hidden;
++	},
++
++	_markCollaborationPaintItem: function(item, color) {
++		if (!item)
++			return null;
++		item._nyaitterRemotePreview = true;
++		item.selectedColor = color || '#0969da';
++		item.selected = false;
++		item.guide = true;
++		item.locked = true;
++		var children = item.getChildren && item.getChildren();
++		for (var i = 0, l = children && children.length || 0; i < l; i++)
++			this._markCollaborationPaintItem(children[i], color);
++		return item;
++	},
++
++	_insertCollaborationPaintItem: function(item, color) {
++		var layer = this._getCollaborationPaintLayer();
++		if (!item || !layer) {
++			if (item)
++				item.remove();
++			return null;
++		}
++		item.setParent(layer);
++		return this._markCollaborationPaintItem(item, color);
++	},
++
++	_importCollaborationPaintItem: function(descriptor, color) {
++		if (!descriptor || descriptor.type !== 'paper-json'
++				|| typeof descriptor.data !== 'string')
++			return null;
++		var project = this._project,
++			wasApplyingPreview = project._nyaitterApplyingCollaborationPreview;
++		project._nyaitterApplyingCollaborationPreview = true;
++		try {
++			return this._insertCollaborationPaintItem(
++				this._project.importJSON(descriptor.data), color);
++		} catch (e) {
++			return null;
++		} finally {
++			project._nyaitterApplyingCollaborationPreview = wasApplyingPreview;
++		}
++	},
++
++	_drawCollaborationPaintSegment: function(draw, color) {
++		if (!draw || (draw.kind !== 'bitmap-brush'
++				&& draw.kind !== 'bitmap-line'))
++			return null;
++		var from = draw.from,
++			to = draw.to,
++			fromX = Number(from && from.x),
++			fromY = Number(from && from.y),
++			toX = Number(to && to.x),
++			toY = Number(to && to.y);
++		if (!isFinite(fromX) || !isFinite(fromY)
++				|| !isFinite(toX) || !isFinite(toY))
++			return null;
++		try {
++			var size = Math.max(1, Number(draw.size) || 1),
++				frame = new Path({
++					segments: [new Point(fromX, fromY), new Point(toX, toY)],
++					strokeColor: color || '#0969da',
++					strokeWidth: size + 4,
++					strokeCap: 'round',
++					strokeJoin: 'round'
++				}),
++				path = new Path({
++				segments: [new Point(fromX, fromY), new Point(toX, toY)],
++				strokeColor: draw.eraser ? '#ffffff' : draw.color || '#000000',
++				strokeWidth: size,
++				strokeCap: 'round',
++				strokeJoin: 'round'
++			});
++			if (draw.eraser) {
++				frame.opacity = 0.7;
++				path.opacity = 0.65;
++			}
++			var group = new Group();
++			group.addChild(frame);
++			group.addChild(path);
++			return this._insertCollaborationPaintItem(group, color);
++		} catch (e) {
++			return null;
++		}
++	},
++
++	_removeCollaborationPaintPreview: function(key) {
++		this._showCollaborationPaintItems(key);
++		var items = this._nyaitterRemotePreviews[key] || [];
++		delete this._nyaitterRemotePreviews[key];
++		for (var i = 0, l = items.length; i < l; i++)
++			items[i].remove();
++	},
++
++	clearCollaborationPaintPreviews: function(participantId) {
++		var prefix = participantId != null ? String(participantId) + ':' : null,
++			previews = this._nyaitterRemotePreviews || {},
++			hidden = this._nyaitterRemoteHiddenItems || {},
++			keys = {};
++		var versions = this._nyaitterRemoteGestureVersions || {};
++		for (var participantKey in versions) {
++			if (participantId == null || participantKey === String(participantId))
++				versions[participantKey].closed = true;
++		}
++		for (var previewKey in previews)
++			keys[previewKey] = true;
++		for (var hiddenKey in hidden)
++			keys[hiddenKey] = true;
++		for (var key in keys) {
++			if (!prefix || key.indexOf(prefix) === 0) {
++				this._removeCollaborationPaintPreview(key);
++			}
++		}
++		var selections = this._nyaitterRemoteSelections || {};
++		for (var selectionKey in selections) {
++			if (!prefix || selectionKey === String(participantId))
++				this._removeCollaborationPaintSelection(selectionKey);
++		}
++		this.update();
++	},
++
++	applyCollaborationPaintPreview: function(preview) {
++		if (!preview)
++			return false;
++		var localSelection = this._captureCollaborationPaintSelection();
++		if (preview.cancelAll) {
++			this.clearCollaborationPaintPreviews(preview.participantId);
++			this._restoreCollaborationPaintSelection(localSelection);
++			return true;
++		}
++		this._scope.activate();
++		this._project.activate();
++		var participantKey = String(preview.participantId || ''),
++			gestureId = Number(preview.gestureId) || 0,
++			sequence = Number(preview.sequence) || 0,
++			imageId = String(preview.imageId || ''),
++			key = participantKey + ':' + gestureId,
++			phase = String(preview.phase || 'update'),
++			previous = this._nyaitterRemoteGestureVersions[participantKey];
++		if (previous && previous.imageId === imageId
++				&& (gestureId < previous.gestureId || gestureId === previous.gestureId
++					&& (previous.closed || sequence <= previous.sequence)))
++			return false;
++		this._nyaitterRemoteGestureVersions[participantKey] = {
++			gestureId: gestureId,
++			sequence: sequence,
++			imageId: imageId,
++			closed: phase === 'end' || phase === 'cancel'
++		};
++		if (Array.isArray(preview.selectionItems)) {
++			var hiddenPaths = preview.hiddenItems || [];
++			var visibleSelectionPaths = preview.selectionItems.filter(function(path) {
++				return !hiddenPaths.some(function(hiddenPath) {
++					var commonLength = Math.min(path.length, hiddenPath.length);
++					for (var index = 0; index < commonLength; index++) {
++						if (path[index] !== hiddenPath[index])
++							return false;
++					}
++					return true;
++				});
++			});
++			this._setCollaborationPaintSelection(
++				preview.participantId, visibleSelectionPaths, preview.previewColor);
++		}
++		if (phase === 'cancel' || phase === 'end') {
++			this._removeCollaborationPaintPreview(key);
++			this._restoreCollaborationPaintSelection(localSelection);
++			this.update();
++			return true;
++		}
++		var descriptors = preview.items || [];
++		var append = preview.draw && preview.draw.kind === 'bitmap-brush'
++				&& phase === 'update',
++			items = append ? this._nyaitterRemotePreviews[key] || [] : [];
++		if (!append)
++			this._removeCollaborationPaintPreview(key);
++		this._hideCollaborationPaintItems(key, preview.hiddenItems || []);
++		for (var i = 0, l = descriptors.length; i < l; i++) {
++			var item = this._importCollaborationPaintItem(
++				descriptors[i], preview.previewColor);
++			if (item) {
++				items.push(item);
++				var itemOutline = this._createCollaborationPaintOutline(
++					item, preview.previewColor);
++				if (itemOutline)
++					items.push(itemOutline);
++			}
++		}
++		var segment = this._drawCollaborationPaintSegment(
++			preview.draw, preview.previewColor);
++		if (segment)
++			items.push(segment);
++		if (items.length)
++			this._nyaitterRemotePreviews[key] = items;
++		this.update();
++		this._restoreCollaborationPaintSelection(localSelection);
++		return true;
++	},
++
+ 	getElement: function() {
+ 		return this._element;
+ 	},
+@@ -13488,9 +14005,109 @@ new function() {
+ 			}
+ 			lastPoint = point;
+ 			if (handle && tool) {
++				var collaborationProject = this._project;
++				var collaborationPreviousPoint = tool.lastPoint && tool.lastPoint.clone
++					? tool.lastPoint.clone() : tool.lastPoint;
++				var collaborationSelectionBefore = mouse.down
++					? this._getCollaborationPaintSelectionItemPaths() : null;
++				if (mouse.down) {
++					delete collaborationProject._nyaitterGestureHiddenItems;
++					delete collaborationProject._nyaitterGestureSelectionItems;
++					collaborationProject._nyaitterSelectionObserved = false;
++					collaborationProject._nyaitterPointerGestureActive = true;
++					var originalPaths = {},
++						paintingLayers = collaborationProject.getLayers();
++					function recordOriginalItem(item, path) {
++						if (item.guide || item._nyaitterRemotePreview
++								|| item._data && item._data.isHelperItem)
++							return;
++						originalPaths[item._id] = path;
++						var children = item._children || [];
++						for (var childIndex = 0; childIndex < children.length; childIndex++)
++							recordOriginalItem(children[childIndex], path.concat(childIndex));
++					}
++					for (var layerIndex = 0; layerIndex < paintingLayers.length; layerIndex++) {
++						var layer = paintingLayers[layerIndex];
++						if (!layer._data || !layer._data.isPaintingLayer)
++							continue;
++						var roots = layer._children || [];
++						for (var rootIndex = 0; rootIndex < roots.length; rootIndex++)
++							recordOriginalItem(roots[rootIndex], [rootIndex]);
++					}
++					collaborationProject._nyaitterGestureOriginalItemPaths = originalPaths;
++				}
++				collaborationProject._nyaitterGestureItems = {};
+ 				called = tool._handleMouseEvent(type, event, point, mouse)
+ 					|| called;
+-			}
++				var collaborationItems = collaborationProject._nyaitterGestureItems;
++				delete collaborationProject._nyaitterGestureItems;
++				if (mouse.down || mouse.up) {
++					var collaborationSelectionAfter =
++						this._getCollaborationPaintSelectionItemPaths();
++					collaborationProject._nyaitterGestureSelectionItems =
++						collaborationProject._nyaitterSelectionObserved || collaborationSelectionAfter.length ? collaborationSelectionAfter :
++							(collaborationSelectionBefore && collaborationSelectionBefore.length ? collaborationSelectionBefore :
++								(collaborationProject._nyaitterGestureSelectionItems || []));
++				}
++				var collaborationHiddenItems =
++					collaborationProject._nyaitterGestureHiddenItems || [];
++                var collaborationSelectionItems =
++					collaborationProject._nyaitterGestureSelectionItems || [];
++				var collaborationOperation = null;
++				if (typeof tool.drawNextLine === 'function'
++						&& Object.prototype.hasOwnProperty.call(tool, 'isEraser')) {
++					collaborationOperation = {
++						kind: 'bitmap-brush',
++						from: collaborationPreviousPoint || point,
++						to: point,
++						color: tool.color || null,
++						size: tool.size || 1,
++						eraser: Boolean(tool.isEraser || !tool.color)
++					};
++				} else if (typeof tool.drawLine === 'function'
++						&& Object.prototype.hasOwnProperty.call(tool, 'startPoint')) {
++					collaborationOperation = {
++						kind: 'bitmap-line',
++						from: tool.startPoint || point,
++						to: point,
++						color: tool.color || null,
++						size: tool.size || 1
++					};
++				}
++				if (mouse.down || mouse.drag || mouse.up) {
++					var collaborationGesture = {
++							phase: mouse.down ? 'start' : mouse.up ? 'end' : 'update',
++							type: type,
++							point: point && point.clone ? point.clone() : point,
++							event: event,
++							tool: tool,
++							operation: collaborationOperation,
++							items: Object.keys(collaborationItems).map(function(id) {
++								return collaborationItems[id];
++							}),
++							hiddenItems: collaborationHiddenItems,
++							selectionItems: collaborationSelectionItems
++						};
++						if (this.responds('editgesture'))
++							this.emit('editgesture', collaborationGesture);
++						var collaborationCanvas = this._element,
++							collaborationWindow = typeof window !== 'undefined' ? window : null;
++						if (collaborationCanvas && collaborationWindow
++								&& typeof collaborationWindow.CustomEvent === 'function') {
++							collaborationCanvas.dispatchEvent(new collaborationWindow.CustomEvent(
++								'nditor-paper-editgesture', { detail: collaborationGesture }));
++						}
++					if (mouse.up) {
++						delete collaborationProject._nyaitterGestureHiddenItems;
++						delete collaborationProject._nyaitterGestureOriginalItemPaths;
++						delete collaborationProject._nyaitterGestureSelectionItems;
++						delete collaborationProject._nyaitterPointerGestureActive;
++						delete collaborationProject._nyaitterSelectionObserved;
++					}
++				}
++				}
++			if (mouse.up && this._project)
++				delete this._project._nyaitterPointerGestureActive;
+ 
+ 			if (
+ 				event.cancelable !== false
+@@ -14715,6 +15332,13 @@ new function() {
+ 			parent = !isRoot && item.getParent(),
+ 			style = [];
+ 
++		if (item._name == null && item._project
++				&& item._project._nyaitterCollaborationChanges
++				&& !item.guide && !item._nyaitterRemotePreview) {
++			var identifier = typeof crypto !== 'undefined' && crypto.randomUUID
++					? crypto.randomUUID() : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
++			item.setName('nditor-' + identifier);
++		}
+ 		if (item._name != null)
+ 			attrs.id = item._name;
+ 
+@@ -14809,6 +15433,8 @@ new function() {
+ 	}
+ 
+ 	function exportSVG(item, options, isRoot) {
++		if (item._nyaitterRemotePreview)
++			return null;
+ 		var exporter = exporters[item._class],
+ 			node = exporter && exporter(item, options);
+ 		if (node) {
+@@ -14835,6 +15461,16 @@ new function() {
+ 
+ 	Project.inject({
+ 		exportSVG: function(options) {
++			var project = this,
++				applying = project._nyaitterApplyingCollaborationPreview,
++				hidden = project.getItems({match: function(item) {
++					return !!item._nyaitterRemoteHiddenOwners;
++				}}).map(function(item) { return [item, item.getVisible()]; });
++			project._nyaitterApplyingCollaborationPreview = true;
++			hidden.forEach(function(entry) {
++				entry[0].setVisible(entry[0]._nyaitterRemoteHiddenOwners._originalVisible);
++			});
++			try {
+ 			options = setOptions(options);
+ 			var children = this._children,
+ 				view = this.getView(),
+@@ -14868,6 +15504,10 @@ new function() {
+ 				parent.appendChild(exportSVG(children[i], options, true));
+ 			}
+ 			return exportDefinitions(node, options);
++			} finally {
++				hidden.forEach(function(entry) { entry[0].setVisible(entry[1]); });
++				project._nyaitterApplyingCollaborationPreview = applying;
++			}
+ 		}
+ 	});
+ };
+@@ -15579,7 +16219,8 @@ var paper = new (PaperScope.inject(Base.exports, {
+ }))();
+ 
+ if (paper.agent.node) {
+-	require('./node/extend.js')(paper);
++	if (typeof module === 'object' && module && module.require)
++		module.require('@turbowarp/paper/dist/node/extend.js')(paper);
+ }
+ 
+ if (typeof define === 'function' && define.amd) {

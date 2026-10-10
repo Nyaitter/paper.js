@@ -3,12 +3,12 @@
   "version": "0.13.0",
   "description": "paper.js fork",
   "license": "MIT",
-  "homepage": "https://github.com/TurboWarp/paper.js",
+  "homepage": "https://github.com/Nyaitter/paper.js",
   "repository": {
     "type": "git",
-    "url": "https://github.com/TurboWarp/paper.js"
+    "url": "https://github.com/Nyaitter/paper.js.git"
   },
-  "bugs": "https://github.com/TurboWarp/paper.js/issues",
+  "bugs": "https://github.com/Nyaitter/paper.js/issues",
   "contributors": [
     "Jürg Lehni <juerg@scratchdisk.com> (http://scratchdisk.com)",
     "Jonathan Puckey <jonathan@puckey.studio> (http://studiomoniker.com)"
@@ -22,7 +22,9 @@
     "docs": "gulp docs",
     "load": "gulp load",
     "jshint": "gulp jshint",
-    "test": "gulp test"
+    "test": "gulp test",
+    "postbuild": "node scripts/apply-nditor-patch.cjs",
+    "postdist": "node scripts/apply-nditor-patch.cjs"
   },
   "files": [
     "AUTHORS.md",
@@ -30,7 +32,9 @@
     "dist/",
     "examples/",
     "LICENSE.txt",
-    "README.md"
+    "README.md",
+    "patches/",
+    "scripts/apply-nditor-patch.cjs"
   ],
   "engines": {
     "node": ">=8.0.0"
